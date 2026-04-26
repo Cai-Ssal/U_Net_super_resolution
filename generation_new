@@ -1,0 +1,236 @@
+import tensorflow as tf
+import numpy as np
+import os
+import cv2
+
+# -------------------------
+# Bézier 参数
+# -------------------------
+def get_t(n_steps):
+    t = np.linspace(0.0, 1.0, n_steps, dtype=np.float32)[:, None]
+    one_minus_t = 1.0 - t
+    return t, one_minus_t
+
+def bezier_curve_np(p0, p1, p2, t, one_minus_t):
+    coords = (one_minus_t**2 * p0 +
+              2 * one_minus_t * t * p1 +
+              t**2 * p2)
+    coords = np.round(coords).astype(np.int32)
+    return np.clip(coords, 0, None)
+
+# -------------------------
+# 平行短线绘制（完全不改）
+# -------------------------
+def draw_parallel_segments(img, occupied, ys, xs, grays,
+                           max_lines=5, seg_length=16, spacing=4.0):
+    n = len(ys)
+    coords = np.stack([ys, xs], axis=1)
+
+    tangents = np.zeros((n, 2), dtype=np.float32)
+    for i in range(n):
+        if i == 0:
+            d = coords[1] - coords[0]
+        elif i == n - 1:
+            d = coords[-1] - coords[-2]
+        else:
+            d = coords[i+1] - coords[i-1]
+        norm = np.linalg.norm(d)
+        tangents[i] = d / (norm + 1e-6)
+
+    perps = np.stack([-tangents[:, 1], tangents[:, 0]], axis=1)
+
+    for i, (y, x, gray) in enumerate(zip(ys, xs, grays)):
+        num_lines = 1 + int(gray * (max_lines - 1))
+        offsets = (np.arange(num_lines) - (num_lines - 1) / 2) * spacing
+
+        for off in offsets:
+            center = np.array([y, x], dtype=np.float32) + off * perps[i]
+            half = seg_length / 2.0
+            p1 = center - tangents[i] * half
+            p2 = center + tangents[i] * half
+            y0, x0 = np.round(p1).astype(int)
+            y1, x1 = np.round(p2).astype(int)
+
+            steps = max(abs(y1 - y0), abs(x1 - x0)) + 1
+            ys_line = np.linspace(y0, y1, steps).astype(int)
+            xs_line = np.linspace(x0, x1, steps).astype(int)
+
+            mask = (
+                (ys_line >= 0) & (ys_line < img.shape[0]) &
+                (xs_line >= 0) & (xs_line < img.shape[1])
+            )
+            img[ys_line[mask], xs_line[mask]] = gray
+            occupied[ys_line[mask], xs_line[mask]] = True
+
+# -------------------------
+# 单张图生成（统一起终点抛物线族）
+# -------------------------
+def generate_single_np(img_size, n_curves, curve_length,
+                       t=None, one_minus_t=None,
+                       overlap_tol=0.06,
+                       max_attempts_multiplier=200,
+                       margin_frac=0.05,
+                       spacing=3.5):
+
+    img = np.zeros((img_size, img_size), dtype=np.float32)
+    occupied = np.zeros((img_size, img_size), dtype=bool)
+
+    start = np.array([0, 0], dtype=np.int32)
+    end   = np.array([0, img_size - 1], dtype=np.int32)
+
+    cx = img_size // 2
+    y_min = int(0.35 * img_size)
+    y_max = int(0.85 * img_size)
+
+    margin = max(1, int(curve_length * float(margin_frac)))
+    success = 0
+    attempts = 0
+    max_attempts = max(5000, int(n_curves * max_attempts_multiplier))
+
+    while success < n_curves and attempts < max_attempts:
+        attempts += 1
+
+        # ---- 灰度生成（不改）----
+        base_gray = np.random.uniform(0.1, 0.9)
+        n_mods = np.random.randint(1, 4)
+        mods = []
+        for _ in range(n_mods):
+            seg_start = np.random.randint(0, curve_length)
+            seg_len = np.random.randint(
+                max(1, curve_length // 10),
+                max(2, curve_length // 3)
+            )
+            delta = np.random.uniform(-0.3, 0.3)
+            mods.append((seg_start, seg_len, delta))
+
+        # ---- 控制点（同一抛物线族）----
+        ctrl = np.array([
+            np.random.randint(y_min, y_max + 1),
+            cx + np.random.randint(-img_size // 40, img_size // 40)
+        ], dtype=np.int32)
+
+        coords = bezier_curve_np(start, ctrl, end, t, one_minus_t)
+        ys, xs = coords[:, 0], coords[:, 1]
+
+        # ---- 重叠检查（不改）----
+        if len(ys[margin:-margin]) > 0:
+            occ_slice = occupied[ys[margin:-margin], xs[margin:-margin]]
+            if float(np.mean(occ_slice)) > overlap_tol:
+                continue
+
+        # ---- 灰度调制（不改）----
+        grays = np.full(curve_length, base_gray, dtype=np.float32)
+        for seg_start, seg_len, delta in mods:
+            seg_end = min(curve_length, seg_start + seg_len)
+            grays[seg_start:seg_end] = np.clip(
+                grays[seg_start:seg_end] + delta, 0.0, 1.0
+            )
+
+        # ---- 平行短线绘制（不改）----
+        draw_parallel_segments(
+            img,
+            occupied,
+            ys,
+            xs,
+            grays,
+            spacing=spacing
+        )
+
+        success += 1
+
+    return img
+
+# -------------------------
+# 批量生成 + 裁切 + 随机旋转
+# -------------------------
+def generate_batch(img_size=712,
+                   min_curves=5,
+                   max_curves=10,
+                   curve_length=200,
+                   batch_size=10,
+                   save_dir="./output",
+                   diag_prob=0.6,
+                   start_seed=10000,
+                   edge_crop_width=100,
+                   overlap_tol=0.0,
+                   spacing=3.5):
+
+    assert 10000 <= start_seed <= 99999
+    os.makedirs(save_dir, exist_ok=True)
+
+    t, one_minus_t = get_t(curve_length)
+
+    c = edge_crop_width
+    y0, y1 = c, img_size - c
+    x0, x1 = c, img_size - c
+
+    for i in range(batch_size):
+        seed = start_seed + i
+        if seed > 99999:
+            seed = 10000 + (seed - 10000) % 90000
+
+        np.random.seed(seed)
+        tf.random.set_seed(seed)
+
+        n_curves = np.random.randint(min_curves, max_curves + 1)
+
+        img_np = generate_single_np(
+            img_size,
+            n_curves,
+            curve_length,
+            t,
+            one_minus_t,
+            overlap_tol=overlap_tol,
+            spacing=spacing
+        )
+
+        center_np = img_np[y0:y1, x0:x1].copy()
+
+        # ---- 随机旋转 ----
+        angle = np.random.uniform(0.0, 360.0)
+        h, w = center_np.shape
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+        center_np = cv2.warpAffine(
+            center_np,
+            M,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
+        )
+
+        crop_tf = tf.convert_to_tensor(center_np[..., None], dtype=tf.float32)
+        crop_uint8 = tf.image.convert_image_dtype(crop_tf, tf.uint8, saturate=True)
+        png_crop = tf.io.encode_png(crop_uint8)
+
+        filename = os.path.join(
+            save_dir,
+            f"curve_img_{i:04d}_hr.png"
+        )
+        tf.io.write_file(filename, png_crop)
+
+        print(
+            f"Saved {filename} | curves={n_curves} | angle={angle:.1f}"
+        )
+
+# -------------------------
+# main
+# -------------------------
+if __name__ == "__main__":
+    if tf.config.list_physical_devices('GPU'):
+        print("Using GPU for encoding.")
+    else:
+        print("GPU not found, using CPU for encoding.")
+
+    generate_batch(
+        img_size=712,
+        min_curves=5,
+        max_curves=10,
+        curve_length=250,
+        batch_size=1,
+        save_dir="D:/cey/CNTs_detials/ML_U_net/test",
+        start_seed=37000,
+        edge_crop_width=100,
+        overlap_tol=0.0,
+        spacing=3.0
+    )

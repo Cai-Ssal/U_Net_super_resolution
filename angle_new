@@ -1,0 +1,204 @@
+import os
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+
+# ----------------- 配置 -----------------
+INPUT_DIR = r"D:\cey\CNTs_detials\ML_U_net\predict"
+OUTPUT_DIR = r"D:\cey\CNTs_detials\ML_U_net\angle"
+ANGLE_MAP_DIR = r"D:\cey\CNTs_detials\ML_U_net\angle_mapped"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(ANGLE_MAP_DIR, exist_ok=True)
+
+GAUSSIAN_BLUR = 1
+CANNY_LOW = 40
+CANNY_HIGH = 120
+MAGNITUDE_THRESHOLD = 3
+OVERLAY_ALPHA = 0.9
+ANGLE_RANGE = 30
+
+# ⭐ 只新增这一行（全局控制）
+global_mode = input("批处理模式？(1=自动 / 2=每张交互)：")
+
+# ----------------- 色谱 -----------------
+rgb_list = [
+    (1.0, 0.0, 0.0),
+    (1.0, 0.5, 0.0),
+    (1.0, 1.0, 0.0),
+    (0.0, 1.0, 0.0),
+    (0.0, 1.0, 1.0),
+    (0.0, 0.0, 1.0),
+    (1.0, 0.0, 1.0),
+]
+rainbow_cmap = LinearSegmentedColormap.from_list("rainbow_custom", rgb_list, N=256)
+
+# ============================================================
+# 批处理循环（不改）
+# ============================================================
+for filename in os.listdir(INPUT_DIR):
+
+    if not filename.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif")):
+        continue
+
+    INPUT_PATH = os.path.join(INPUT_DIR, filename)
+
+    name, _ = os.path.splitext(filename)
+    OUTPUT_PATH = os.path.join(OUTPUT_DIR, name + "_angle.png")
+    ANGLE_MAP_PATH = os.path.join(ANGLE_MAP_DIR, name + "_angle_map.png")
+
+    # ----------------- 读取 -----------------
+    if not os.path.exists(INPUT_PATH):
+        raise FileNotFoundError(INPUT_PATH)
+
+    img = cv2.imread(INPUT_PATH, cv2.IMREAD_UNCHANGED)
+
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
+
+    # ⭐ 只记录灰度 > 100
+    record_mask = gray > 80
+    record_coords = np.column_stack(np.where(record_mask))
+
+    # ----------------- CLAHE -----------------
+    clahe = cv2.createCLAHE(2.0, (8, 8))
+    gray = clahe.apply(gray)
+
+    # ----------------- 预处理 -----------------
+    if GAUSSIAN_BLUR > 0:
+        gray_blur = cv2.GaussianBlur(gray, (0,0), GAUSSIAN_BLUR)
+    else:
+        gray_blur = gray
+
+    # ----------------- 边缘 -----------------
+    edges = cv2.Canny(gray_blur, CANNY_LOW, CANNY_HIGH)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    edges_dilated = cv2.dilate(edges, kernel, iterations=1)
+
+    # ----------------- Sobel -----------------
+    sobel_dx = cv2.Sobel(gray_blur.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+    sobel_dy = cv2.Sobel(gray_blur.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+
+    magnitude = np.hypot(sobel_dx, sobel_dy)
+
+    angle_rad = np.arctan2(sobel_dy, sobel_dx)
+    angle_deg = np.degrees(angle_rad) + 90.0
+
+    angle_deg = np.where(angle_deg > 90, angle_deg - 180, angle_deg)
+    angle_deg = np.where(angle_deg < -90, angle_deg + 180, angle_deg)
+
+    angle_180 = angle_deg.copy()
+    angle_180[angle_180 < 0] += 180
+
+    # ============================================================
+    # ⭐ 这里是唯一修改点：保留你的交互逻辑
+    # ============================================================
+    if global_mode == "2":
+        print("\n选择角度模式：")
+        print("1 → 自动主方向")
+        print("2 → 手动输入")
+        mode = input("输入 1 或 2：")
+    else:
+        mode = "1"
+
+    # ----------------- 角度选择（原样） -----------------
+    if mode == "1":
+        edge_mask = (edges_dilated > 0) & (magnitude >= MAGNITUDE_THRESHOLD)
+        angles = angle_180[edge_mask]
+        weights = magnitude[edge_mask]
+
+        hist, bins = np.histogram(angles, bins=180, range=(0,180), weights=weights)
+        idx = np.argmax(hist)
+        target_angle = (bins[idx] + bins[idx+1]) / 2
+
+    elif mode == "2":
+        target_angle = float(input("输入角度(0~180): "))
+    else:
+        raise ValueError("输入错误")
+
+    # ----------------- 角度筛选 -----------------
+    angle_diff = np.abs(angle_180 - target_angle)
+    angle_diff = np.minimum(angle_diff, 180 - angle_diff)
+
+    angle_mask = angle_diff <= ANGLE_RANGE
+
+    mask = (edges_dilated > 0) & (magnitude >= MAGNITUDE_THRESHOLD) & angle_mask
+
+    # ----------------- 边缘染色 -----------------
+    t = 1.0 - np.clip(angle_diff / ANGLE_RANGE, 0, 1)
+
+    h, w = gray.shape
+    angle_rgb = np.zeros((h, w, 3), dtype=np.float32)
+
+    if np.count_nonzero(mask) > 0:
+        angle_rgb[mask] = rainbow_cmap(t[mask])[:, :3]
+
+    # ============================================================
+    # 单点结构方向染色（完全未改）
+    # ============================================================
+
+    seed_mask = np.any(angle_rgb > 0, axis=2)
+    base_color = angle_rgb.copy()
+
+    for (y, x) in record_coords:
+
+        if seed_mask[y, x]:
+            continue
+
+        dx = sobel_dx[y, x]
+        dy = sobel_dy[y, x]
+
+        norm = np.sqrt(dx*dx + dy*dy) + 1e-6
+        dx /= norm
+        dy /= norm
+
+        tx = -dy
+        ty = dx
+
+        color_sum = np.zeros(3, np.float32)
+        weight_sum = 0.0
+
+        for step in range(-12, 13):
+
+            nx = int(x + step * tx)
+            ny = int(y + step * ty)
+
+            if nx < 0 or nx >= w or ny < 0 or ny >= h:
+                continue
+
+            if seed_mask[ny, nx]:
+                w_ = np.exp(-abs(step) / 5.0)
+                color_sum += base_color[ny, nx] * w_
+                weight_sum += w_
+
+        if weight_sum > 1e-6:
+            color = color_sum / weight_sum
+
+            max_c = np.max(color) + 1e-6
+            color = color / max_c
+            color = np.clip(color ** 0.7, 0, 1)
+
+            angle_rgb[y, x] = color
+
+    # ----------------- 输出（原样） -----------------
+    gray_norm = gray.astype(np.float32) / 255.0
+    bg_rgb = np.dstack([gray_norm, gray_norm, gray_norm])
+
+    overlay = (1 - OVERLAY_ALPHA) * bg_rgb + OVERLAY_ALPHA * angle_rgb
+
+    out_img = np.clip(overlay * 255.0, 0, 255).astype(np.uint8)
+    cv2.imwrite(OUTPUT_PATH, cv2.cvtColor(out_img, cv2.COLOR_RGB2BGR))
+
+    # ----------------- 角度图 -----------------
+    angle_map_vis = np.zeros((h, w, 3), dtype=np.float32)
+    angle_map_vis[mask] = angle_rgb[mask]
+
+    angle_map_vis = (np.clip(angle_map_vis * 255.0, 0, 255)).astype(np.uint8)
+    cv2.imwrite(ANGLE_MAP_PATH, cv2.cvtColor(angle_map_vis, cv2.COLOR_RGB2BGR))
+
+    print(f"完成：{filename}")
+
+print("\n全部处理完成")

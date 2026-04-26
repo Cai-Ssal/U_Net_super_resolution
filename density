@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""
+batch_map_grayscale.py
+
+功能：
+  - 批量读取输入文件夹中的图片（可递归）
+  - 将每张图片转换为灰度，按灰度值在 vmin..vmax 范围内映射到彩虹色带
+  - 可选：把灰度值保存为文本文件（# width=... height=... 格式）
+  - 保存映射后的图片到输出文件夹，保留原文件名并加后缀 _mapped.png
+
+用法示例：
+  python batch_map_grayscale.py --input_dir ./images --output_dir ./out --save_txt --recursive
+
+"""
+
+import os
+import argparse
+from PIL import Image
+import numpy as np
+
+# 支持的图片扩展（小写）
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif", ".webp"}
+
+def find_image_files(root_dir, recursive=False):
+    files = []
+    if recursive:
+        for dirpath, _, filenames in os.walk(root_dir):
+            for fn in filenames:
+                if os.path.splitext(fn)[1].lower() in IMAGE_EXTS:
+                    files.append(os.path.join(dirpath, fn))
+    else:
+        for fn in os.listdir(root_dir):
+            full = os.path.join(root_dir, fn)
+            if os.path.isfile(full) and os.path.splitext(fn)[1].lower() in IMAGE_EXTS:
+                files.append(full)
+    return sorted(files)
+
+def save_grayscale_txt(arr, txt_path):
+    """保存灰度数组到 txt，第一行注释为 # width=... height=...，每行空格分隔"""
+    h, w = arr.shape
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(f"# width={w} height={h}\n")
+        for y in range(h):
+            row = " ".join(map(str, arr[y].tolist()))
+            f.write(row + "\n")
+
+def map_grayscale_to_rainbow(arr, vmin=60, vmax=150, stops=None):
+    """
+    将单通道灰度数组（uint8）映射到 RGB 彩色。
+    - arr: np.ndarray, dtype uint8, shape (h, w)
+    - vmin, vmax: 映射范围（不包含等号的处理与原脚本一致：mask = (arr > vmin) & (arr < vmax)）
+    - stops: (N,3) array of RGB stops in 0..1 range. 如果为 None，则使用默认彩虹色带。
+    返回 uint8 RGB 图像 (h, w, 3)
+    """
+    if stops is None:
+        stops = np.array([
+            (1.0, 0.0, 0.0),   # red
+            (1.0, 0.5, 0.0),   # orange
+            (1.0, 1.0, 0.0),   # yellow
+            (0.0, 1.0, 0.0),   # green
+            (0.0, 1.0, 1.0),   # cyan
+            (0.0, 0.0, 1.0),   # blue
+            (0.5, 0.0, 0.5),   # purple
+        ], dtype=float)
+
+    arr_u8 = arr.astype(np.uint8)
+    h, w = arr_u8.shape
+    out = np.zeros((h, w, 3), dtype=np.uint8)
+
+    # mask: 严格大于 vmin 且严格小于 vmax，和你原脚本保持一致
+    mask = (arr_u8 > vmin) & (arr_u8 < vmax)
+    vals = arr_u8.astype(float)
+    span = float(vmax - vmin) if vmax != vmin else 1.0
+
+    t = np.zeros_like(vals, dtype=float)
+    t[mask] = (vals[mask] - vmin) / span
+
+    seg_count = stops.shape[0] - 1
+    seg_pos = t * seg_count
+    seg_index = np.floor(seg_pos).astype(int)
+    seg_index = np.clip(seg_index, 0, seg_count - 1)
+    seg_frac = seg_pos - seg_index
+
+    # 为每个通道按段线性插值
+    for c in range(3):
+        channel = np.zeros((h, w), dtype=float)
+        for s in range(seg_count):
+            idx = seg_index == s
+            if not np.any(idx):
+                continue
+            ch0 = stops[s, c]
+            ch1 = stops[s+1, c]
+            # seg_frac 对应位置可能为 0..1
+            channel[idx] = ch0 + (ch1 - ch0) * seg_frac[idx]
+        out[..., c][mask] = np.clip((channel[mask] * 255.0), 0, 255).astype(np.uint8)
+
+    # outside mask -> 保持灰度（复制到三个通道）
+    outside = ~mask
+    for c in range(3):
+        out[..., c][outside] = arr_u8[outside]
+
+    return out
+
+def process_image_file(img_path, out_dir, save_txt=False, vmin=60, vmax=150, stops=None, keep_subdirs=False, input_root=None):
+    """
+    处理单个图片文件：
+      - 读取并转为灰度
+      - 可选：保存灰度 txt（保存路径与输出图像同目录）
+      - 映射到彩虹色并保存图像
+    """
+    try:
+        img = Image.open(img_path).convert("L")
+    except Exception as e:
+        print(f"[ERROR] 无法打开图片 {img_path}: {e}")
+        return False
+
+    arr = np.array(img, dtype=np.uint8)
+    # 决定输出目录（保持子目录结构可选）
+    if keep_subdirs and input_root is not None:
+        rel = os.path.relpath(os.path.dirname(img_path), input_root)
+        target_dir = os.path.join(out_dir, rel)
+    else:
+        target_dir = out_dir
+    os.makedirs(target_dir, exist_ok=True)
+
+    base_name = os.path.splitext(os.path.basename(img_path))[0]
+    mapped_name = f"{base_name}_density.png"
+    mapped_path = os.path.join(target_dir, mapped_name)
+
+    if save_txt:
+        txt_name = f"{base_name}.txt"
+        txt_path = os.path.join(target_dir, txt_name)
+        save_grayscale_txt(arr, txt_path)
+
+    rgb = map_grayscale_to_rainbow(arr, vmin=vmin, vmax=vmax, stops=stops)
+    Image.fromarray(rgb).save(mapped_path)
+    print(f"[OK] {img_path} -> {mapped_path}")
+    return True
+
+def main():
+    parser = argparse.ArgumentParser(description="批量把文件夹内图片的灰度值（区间 vmin..vmax）映射为彩虹色并保存")
+    parser.add_argument("--input_dir", "-i", type=str, help="输入图片文件夹路径（必须）")
+    parser.add_argument("--output_dir", "-o", type=str, help="输出保存文件夹路径（必须）")
+    parser.add_argument("--vmin", type=int, default=60, help="映射下限（默认 60）")
+    parser.add_argument("--vmax", type=int, default=120, help="映射上限（默认 150）")
+    parser.add_argument("--save_txt", action="store_true", help="是否同时把灰度值保存为 txt 文件（默认否）")
+    parser.add_argument("--recursive", action="store_true", help="是否递归遍历子目录（默认否）")
+    parser.add_argument("--keep_subdirs", action="store_true", help="在输出目录中保留输入目录的子目录结构（仅当 --recursive 有用）")
+    args = parser.parse_args()
+
+    # 如果命令行没有提供路径，交互式询问（方便直接双击运行）
+    input_dir = args.input_dir or input("请输入要处理的输入文件夹路径: ").strip()
+    output_dir = args.output_dir or input("请输入输出保存文件夹路径: ").strip()
+
+    if not os.path.isdir(input_dir):
+        print(f"[ERROR] 输入路径不是文件夹或不存在: {input_dir}")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    files = find_image_files(input_dir, recursive=args.recursive)
+    if not files:
+        print("[INFO] 未在输入目录找到支持的图片文件。支持扩展名:", ", ".join(sorted(IMAGE_EXTS)))
+        return
+
+    print(f"[INFO] 找到 {len(files)} 张图片，开始处理 ...")
+    success = 0
+    for fp in files:
+        ok = process_image_file(fp, output_dir, save_txt=args.save_txt, vmin=args.vmin, vmax=args.vmax,
+                                stops=None, keep_subdirs=args.keep_subdirs, input_root=input_dir)
+        if ok:
+            success += 1
+
+    print(f"[DONE] 处理完成：{success}/{len(files)} 保存到 -> {output_dir}")
+
+if __name__ == "__main__":
+    main()
