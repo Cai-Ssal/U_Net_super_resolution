@@ -1,0 +1,1554 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CNT_LB_fluid_coupled_final.py
+
+二维有效界面模型：刚性直碳纳米管(CNT) + 双挡板压缩 + 不可压缩流体。
+
+模型定位
+--------
+这是用于 CNT Langmuir-Blodgett (LB) 膜数据集仿真的二维约化模型，不是完整
+三维自由液面 CFD。内部物理量全部使用 SI 单位；512x512 只用于最终渲染。
+
+核心机制
+--------
+1. 二维不可压缩 Navier-Stokes。
+2. 左右移动挡板用 Brinkman 体积惩罚表示。
+3. 温度对流-扩散 + 约化 Boussinesq 热浮力。
+4. Marangoni 表面张力梯度：温度 + CNT 覆盖率共同产生。
+5. 刚性直 CNT：只有平移和转动，绝不弯曲。
+6. Jeffery 型流致转动：取向来自局部速度梯度，而非预设角度。
+7. CNT-CNT：短程排斥 + 有限程吸引 + apolar nematic 取向作用。
+8. Brownian 平移/转动。
+9. 严格线段相交检测 + 接触修正，禁止 CNT 交叉。
+10. CNT 对流体的反馈通过非流体相互作用力的反作用沉积到 Eulerian 网格。
+11. 不设置 late-stage alignment boost，不人为指定局部目标角度。
+12. 同时输出 global/local nematic order，便于验证“整体弱取向、局部强取向”。
+
+重要假设
+--------
+- y 方向为周期边界，代表较宽的槽宽方向。
+- x 方向为计算域外边界；挡板位于域内部并通过 Brinkman 惩罚形成移动固体。
+- 自然对流是二维有效界面层中的约化 Boussinesq 项，不代表完整三维热对流。
+- CNT 是线段中心线，不解析 1 nm 真实直径；覆盖率和流体反馈均为粗粒化。
+"""
+
+from __future__ import annotations
+
+import csv
+import os
+import json
+import math
+import csv
+import json
+import math
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+from scipy.fft import dct, idct, fft, ifft
+
+# ------------------------------------------------------------
+# 可选 GPU 加速：优先使用 NVIDIA CUDA + CuPy。
+# 若未安装 CuPy 或没有可用 CUDA GPU，则自动回退 CPU。
+# CNT 几何严格接触检查仍保留在 CPU，以避免改变物理约束逻辑。
+# ------------------------------------------------------------
+try:
+    import cupy as cp
+    try:
+        from cupyx.scipy.fft import dct as cp_dct, idct as cp_idct, fft as cp_fft, ifft as cp_ifft
+        _CUPY_DCT_AVAILABLE = True
+    except Exception:
+        _CUPY_DCT_AVAILABLE = False
+except Exception:
+    cp = None
+    _CUPY_DCT_AVAILABLE = False
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+KB = 1.380649e-23
+
+
+# ============================================================
+# 1. 参数
+# ============================================================
+
+@dataclass
+# GPU 5-min optimized: preserve 12000 physical steps while reducing expensive updates.
+class Params:
+    # ---------- 水/空气界面：有效液相参数 ----------
+    rho: float = 997.0
+    mu: float = 8.90e-4
+    sigma0: float = 7.20e-2
+    dsigma_dT: float = -1.50e-4
+    beta_T: float = 2.07e-4
+    kappa_T: float = 1.43e-7
+    T0: float = 298.15
+    T_hot: float = 299.15
+    T_cold: float = 298.15
+    gravity: float = 9.81
+
+    # 有效界面水动力厚度
+    interface_depth: float = 5.0e-5
+
+    # ---------- 计算域 ----------
+    Lx: float = 1.0e-3
+    Ly: float = 1.0e-3
+    nx: int = 64
+    ny: int = 64
+    output_px: int = 512
+    render_px: int = 1024  # 先以 1024x1024 超采样渲染，再裁剪最终压缩区并缩放到 512x512
+
+    # ---------- 时间 ----------
+    dt: float = 2.0e-5
+    n_steps: int = 12000
+    save_every: int = 100
+
+    # ---------- 双挡板 ----------
+    barrier_speed: float = 7.0e-4
+    initial_gap: float = 8.0e-4
+    final_gap: float = 2.8e-4
+    barrier_width: float = 2.0e-5
+    barrier_penalty_rate: float = 3.0e4
+
+    # ---------- 温度 ----------
+    # 约化二维模型中，重力投影到界面平面。
+    buoyancy_angle_deg: float = 90.0
+    temperature_relaxation: float = 2.0e-4
+    thermal_gradient_strength: float = 1.0
+
+    # ---------- CNT ----------
+    # 每次运行随机生成 100~150 根 CNT（含 100 和 150）
+    n_rods_min: int = 200
+    n_rods_max: int = 250
+    n_rods: int = 125  # 运行时会被随机值覆盖，仅作为默认值
+    rod_length_min: float = 1.8e-5
+    rod_length_max: float = 4.0e-5
+    rod_diameter: float = 1.0e-9
+    initial_clearance: float = 2.0e-6
+    contact_clearance: float = 1.5e-9
+
+    # ---------- CNT 水动力 ----------
+    drag_log_floor: float = 3.0
+    drag_coupling_scale: float = 1.0
+    rotational_drag_scale: float = 1.0
+
+    # ---------- CNT-CNT 有效相互作用（本版本关闭） ----------
+    repulsion_strength: float = 4.0e-19
+    attraction_strength: float = 1.5e-19
+    alignment_strength: float = 2.0e-19
+    interaction_cutoff: float = 7.0e-6
+    repulsion_length: float = 1.0e-6
+    attraction_length: float = 4.0e-6
+    orient_length: float = 5.0e-6
+
+    # ---------- Brownian ----------
+    temperature_cnt: float = 298.15
+    brownian_translation_scale: float = 1.0
+    brownian_rotation_scale: float = 0.5
+
+    # ---------- 数值安全 ----------
+    max_fluid_speed: float = 5.0e-4
+    max_cnt_speed: float = 2.0e-4
+    max_angular_speed: float = 80.0
+    max_force_per_rod: float = 2.0e-12
+    interaction_stride: int = 2
+    coverage_stride: int = 16
+
+    # ---------- GPU ----------
+    # True：有可用 NVIDIA CUDA + CuPy 时启用 GPU；否则自动回退 CPU。
+    use_gpu: bool = True
+    gpu_device: int = 0
+
+    # ---------- 随机种子 ----------
+    seed: int = 20261028
+
+    @property
+    def nu(self) -> float:
+        return self.mu / self.rho
+
+
+P = Params()
+
+
+# ============================================================
+# 2. 几何工具
+# ============================================================
+
+def wrap_angle(theta):
+    """CNT 无头无尾，因此 theta 与 theta+pi 等价。"""
+    return (theta + 0.5 * np.pi) % np.pi - 0.5 * np.pi
+
+
+def clamp_norm(v: np.ndarray, max_norm: float) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n > max_norm and n > 0.0:
+        return v * (max_norm / n)
+    return v
+
+
+def segment_endpoints(center: np.ndarray, theta: float, length: float):
+    p = np.array([math.cos(theta), math.sin(theta)], dtype=float)
+    h = 0.5 * length * p
+    return center - h, center + h
+
+
+def point_segment_distance(point, a, b):
+    ab = b - a
+    den = float(np.dot(ab, ab))
+    if den <= 1e-30:
+        return float(np.linalg.norm(point - a))
+    t = float(np.dot(point - a, ab) / den)
+    t = np.clip(t, 0.0, 1.0)
+    q = a + t * ab
+    return float(np.linalg.norm(point - q))
+
+
+def closest_points_segments(p1, q1, p2, q2):
+    """两条有限二维线段的最近点。"""
+    d1 = q1 - p1
+    d2 = q2 - p2
+    r = p1 - p2
+    a = float(np.dot(d1, d1))
+    e = float(np.dot(d2, d2))
+    f = float(np.dot(d2, r))
+    eps = 1e-30
+
+    if a <= eps and e <= eps:
+        return p1.copy(), p2.copy()
+    if a <= eps:
+        s = 0.0
+        t = np.clip(f / e, 0.0, 1.0)
+    else:
+        c = float(np.dot(d1, r))
+        if e <= eps:
+            t = 0.0
+            s = np.clip(-c / a, 0.0, 1.0)
+        else:
+            b = float(np.dot(d1, d2))
+            den = a * e - b * b
+            if abs(den) > 1e-30:
+                s = np.clip((b * f - c * e) / den, 0.0, 1.0)
+            else:
+                s = 0.0
+            t = (b * s + f) / e
+            if t < 0.0:
+                t = 0.0
+                s = np.clip(-c / a, 0.0, 1.0)
+            elif t > 1.0:
+                t = 1.0
+                s = np.clip((b - c) / a, 0.0, 1.0)
+    return p1 + s * d1, p2 + t * d2
+
+
+def proper_or_touching_segment_intersection(a, b, c, d, tol=1e-14):
+    """包含端点接触的严格二维线段相交检测。"""
+    def orient(p, q, r):
+        # 修正后的二维叉积：第二项必须使用 r[0]，不能重复 c[1]-a[1]。
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    def on_segment(p, q, r):
+        return (
+            min(p[0], r[0]) - tol <= q[0] <= max(p[0], r[0]) + tol
+            and min(p[1], r[1]) - tol <= q[1] <= max(p[1], r[1]) + tol
+        )
+
+    o1, o2 = orient(a, b, c), orient(a, b, d)
+    o3, o4 = orient(c, d, a), orient(c, d, b)
+
+    if ((o1 > tol and o2 < -tol) or (o1 < -tol and o2 > tol)) and \
+       ((o3 > tol and o4 < -tol) or (o3 < -tol and o4 > tol)):
+        return True
+    if abs(o1) <= tol and on_segment(a, c, b):
+        return True
+    if abs(o2) <= tol and on_segment(a, d, b):
+        return True
+    if abs(o3) <= tol and on_segment(c, a, d):
+        return True
+    if abs(o4) <= tol and on_segment(c, b, d):
+        return True
+    return False
+
+
+def segment_distance(a, b, c, d):
+    if proper_or_touching_segment_intersection(a, b, c, d):
+        return 0.0
+    p, q = closest_points_segments(a, b, c, d)
+    return float(np.linalg.norm(p - q))
+
+
+def minimum_image_periodic_y(dy, Ly):
+    return dy - Ly * np.round(dy / Ly)
+
+
+def wrap_y(y, Ly):
+    return np.mod(y, Ly)
+
+
+# ============================================================
+# 3. CNT 状态
+# ============================================================
+
+@dataclass
+class CNTState:
+    x: np.ndarray
+    y: np.ndarray
+    theta: np.ndarray
+    length: np.ndarray
+
+    @property
+    def n(self):
+        return len(self.x)
+
+
+# ============================================================
+# 4. 流体求解器
+# ============================================================
+
+class FluidSolver:
+    """二维有效界面不可压缩 NS + Brinkman + thermal + Marangoni。
+
+    GPU 版本说明
+    ------------
+    - 流体场、温度场、压力投影和 FFT/DCT 在 NVIDIA GPU 上执行。
+    - CNT 几何/接触约束仍在 CPU 执行。
+    - 每个时间步只在 CPU/GPU 之间交换 64x64 级别的场数据和 180 根 CNT
+      的局部速度梯度，因此不会为了 GPU 化而改变原有物理模型。
+    """
+
+    def __init__(self, p: Params):
+        self.p = p
+        self.dx = p.Lx / p.nx
+        self.dy = p.Ly / p.ny
+
+        self.use_gpu = False
+        self.xp = np
+        self.dct_fn = dct
+        self.idct_fn = idct
+        self.fft_fn = fft
+        self.ifft_fn = ifft
+
+        if p.use_gpu and cp is not None and _CUPY_DCT_AVAILABLE:
+            try:
+                ndev = cp.cuda.runtime.getDeviceCount()
+                if ndev > 0:
+                    if p.gpu_device < 0 or p.gpu_device >= ndev:
+                        raise RuntimeError(
+                            f"gpu_device={p.gpu_device} 超出可用 GPU 数量 {ndev}"
+                        )
+                    cp.cuda.Device(p.gpu_device).use()
+                    self.use_gpu = True
+                    self.xp = cp
+                    self.dct_fn = cp_dct
+                    self.idct_fn = cp_idct
+                    self.fft_fn = cp_fft
+                    self.ifft_fn = cp_ifft
+                    print(
+                        f"[GPU] CUDA/CuPy 已启用: device {p.gpu_device} "
+                        f"({cp.cuda.runtime.getDeviceProperties(p.gpu_device)['name'].decode(errors='ignore')})"
+                    )
+                else:
+                    print("[GPU] 未检测到 CUDA GPU，自动回退 CPU。")
+            except Exception as exc:
+                print(f"[GPU] GPU 初始化失败，自动回退 CPU：{exc}")
+        elif p.use_gpu:
+            if cp is None:
+                print("[GPU] 未安装 CuPy，自动回退 CPU。")
+            else:
+                print("[GPU] 当前 CuPy 环境缺少 cupyx.scipy.fft DCT/IDCT，自动回退 CPU。")
+
+        xp = self.xp
+
+        self.x = (xp.arange(p.nx) + 0.5) * self.dx
+        self.y = (xp.arange(p.ny) + 0.5) * self.dy
+        self.X, self.Y = xp.meshgrid(self.x, self.y)
+
+        self.u = xp.zeros((p.ny, p.nx), dtype=float)
+        self.v = xp.zeros_like(self.u)
+
+        # 温度初始场：沿 x 的弱梯度；这里注释与实际方向保持一致。
+        grad = (
+            self.X / p.Lx - 0.5
+        ) * (p.T_hot - p.T_cold) * p.thermal_gradient_strength
+        self.T = p.T0 + grad
+
+        # 细胞中心 Neumann-x / periodic-y 的离散 Laplacian 特征值。
+        kx = xp.arange(p.nx)
+        ky = xp.fft.fftfreq(p.ny) * p.ny
+        lam_x = -4.0 * xp.sin(0.5 * xp.pi * kx / p.nx) ** 2 / self.dx**2
+        lam_y = -4.0 * xp.sin(xp.pi * ky / p.ny) ** 2 / self.dy**2
+        self.lap_eigs = lam_y[:, None] + lam_x[None, :]
+        self.lap_eigs[0, 0] = 1.0
+
+        self.barrier_x_left = 0.5 * (p.Lx - p.initial_gap)
+        self.barrier_x_right = 0.5 * (p.Lx + p.initial_gap)
+
+    def to_cpu(self, a):
+        """将 GPU 数组转为 NumPy；CPU 模式下零开销返回。"""
+        if self.use_gpu:
+            return cp.asnumpy(a)
+        return a
+
+    # ---------- 差分 ----------
+    def ddx(self, a):
+        xp = self.xp
+        out = xp.empty_like(a)
+        out[:, 1:-1] = (a[:, 2:] - a[:, :-2]) / (2.0 * self.dx)
+        # 计算域外边界采用零法向梯度的一阶实现。
+        out[:, 0] = 0.0
+        out[:, -1] = 0.0
+        return out
+
+    def ddy(self, a):
+        xp = self.xp
+        out = xp.empty_like(a)
+        out[1:-1, :] = (a[2:, :] - a[:-2, :]) / (2.0 * self.dy)
+        out[0, :] = (a[1, :] - a[-1, :]) / (2.0 * self.dy)
+        out[-1, :] = (a[0, :] - a[-2, :]) / (2.0 * self.dy)
+        return out
+
+    def laplacian(self, a):
+        xp = self.xp
+        out = xp.empty_like(a)
+
+        # x：Neumann 外边界，不再错误地把左右边界连接成周期边界。
+        out[:, 1:-1] = (
+            a[:, 2:] - 2.0 * a[:, 1:-1] + a[:, :-2]
+        ) / self.dx**2
+        out[:, 0] = 2.0 * (a[:, 1] - a[:, 0]) / self.dx**2
+        out[:, -1] = 2.0 * (a[:, -2] - a[:, -1]) / self.dx**2
+
+        # y：周期边界。
+        out[1:-1, :] += (
+            a[2:, :] - 2.0 * a[1:-1, :] + a[:-2, :]
+        ) / self.dy**2
+        out[0, :] += (a[1, :] - 2.0 * a[0, :] + a[-1, :]) / self.dy**2
+        out[-1, :] += (a[0, :] - 2.0 * a[-1, :] + a[-2, :]) / self.dy**2
+        return out
+
+    def advect_upwind(self, a, u, v):
+        """一阶迎风对流项，x非周期、y周期。"""
+        xp = self.xp
+        dax = xp.empty_like(a)
+        day = xp.empty_like(a)
+
+        dax[:, 1:-1] = xp.where(
+            u[:, 1:-1] >= 0.0,
+            (a[:, 1:-1] - a[:, :-2]) / self.dx,
+            (a[:, 2:] - a[:, 1:-1]) / self.dx,
+        )
+        dax[:, 0] = 0.0
+        dax[:, -1] = 0.0
+
+        a_up = xp.roll(a, 1, axis=0)
+        a_dn = xp.roll(a, -1, axis=0)
+        day[:] = xp.where(v >= 0.0, (a - a_up) / self.dy, (a_dn - a) / self.dy)
+        return u * dax + v * day
+
+    # ---------- 移动挡板 ----------
+    def update_barriers(self, time):
+        p = self.p
+        half_closure = 0.5 * (p.initial_gap - p.final_gap)
+        closure = min(half_closure, p.barrier_speed * time)
+        self.barrier_x_left = 0.5 * (p.Lx - p.initial_gap) + closure
+        self.barrier_x_right = 0.5 * (p.Lx + p.initial_gap) - closure
+
+    def barrier_mask_and_velocity(self):
+        p = self.p
+        xp = self.xp
+        w = p.barrier_width
+        left = self.X <= self.barrier_x_left + 0.5 * w
+        right = self.X >= self.barrier_x_right - 0.5 * w
+        mask = left | right
+
+        us = xp.zeros_like(self.u)
+        vs = xp.zeros_like(self.v)
+        us[left] = p.barrier_speed
+        us[right] = -p.barrier_speed
+        return mask, us, vs
+
+    # ---------- 压力投影 ----------
+    def pressure_projection(self, u_star, v_star):
+        xp = self.xp
+        div = self.ddx(u_star) + self.ddy(v_star)
+        rhs = div / self.p.dt
+
+        # x: DCT-II；y: FFT。两者与当前离散边界假设一致。
+        rhs_hat = self.fft_fn(
+            self.dct_fn(rhs, type=2, axis=1, norm="ortho"),
+            axis=0,
+        )
+        p_hat = rhs_hat / self.lap_eigs
+        p_hat[0, 0] = 0.0
+
+        pressure = self.idct_fn(
+            self.ifft_fn(p_hat, axis=0).real,
+            type=3,
+            axis=1,
+            norm="ortho",
+        )
+        dpdx = self.ddx(pressure)
+        dpdy = self.ddy(pressure)
+
+        u_new = u_star - self.p.dt * dpdx / self.p.rho
+        v_new = v_star - self.p.dt * dpdy / self.p.rho
+        return u_new, v_new, pressure
+
+    # ---------- 一个流体时间步 ----------
+    def step(self, cnt_force, cnt_coverage, time):
+        p = self.p
+        xp = self.xp
+
+        self.update_barriers(time)
+        mask, us, vs = self.barrier_mask_and_velocity()
+
+        # 单向耦合：本版本关闭“CNT -> 水”的全部反馈。
+        # 保留 CNT-CNT 相互作用、Brownian、接触、Jeffery 旋转等其它机制不变。
+        # 因此流体只由自身的 NS + Brinkman + Boussinesq + 温度 Marangoni 决定。
+        xp0 = self.xp
+        cnt_force_x = xp0.zeros_like(self.u)
+        cnt_force_y = xp0.zeros_like(self.v)
+        cnt_coverage_gpu = xp0.zeros_like(self.u)
+
+        adv_u = self.advect_upwind(self.u, self.u, self.v)
+        adv_v = self.advect_upwind(self.v, self.u, self.v)
+
+        # ---------- 约化 Boussinesq ----------
+        ang = np.deg2rad(p.buoyancy_angle_deg)
+        gx = p.gravity * np.cos(ang)
+        gy = p.gravity * np.sin(ang)
+        buoy_x = p.rho * p.beta_T * (self.T - p.T0) * gx
+        buoy_y = p.rho * p.beta_T * (self.T - p.T0) * gy
+
+        # ---------- Marangoni ----------
+        # phi 为无量纲 CNT 覆盖率。
+        dsigma_dphi = -2.0e-3
+        sigma = (
+            p.sigma0
+            + p.dsigma_dT * (self.T - p.T0)
+            + dsigma_dphi * cnt_coverage_gpu
+        )
+        mar_x = self.ddx(sigma) / p.interface_depth
+        mar_y = self.ddy(sigma) / p.interface_depth
+
+        # ---------- NS predictor ----------
+        lap_u = self.laplacian(self.u)
+        lap_v = self.laplacian(self.v)
+        u_star = self.u + p.dt * (
+            -adv_u + p.nu * lap_u
+            + (buoy_x + mar_x + cnt_force_x) / p.rho
+        )
+        v_star = self.v + p.dt * (
+            -adv_v + p.nu * lap_v
+            + (buoy_y + mar_y + cnt_force_y) / p.rho
+        )
+
+        # ---------- Brinkman moving solid ----------
+        lam = p.barrier_penalty_rate
+        fac = 1.0 + p.dt * lam
+        u_star[mask] = (u_star[mask] + p.dt * lam * us[mask]) / fac
+        v_star[mask] = (v_star[mask] + p.dt * lam * vs[mask]) / fac
+
+        # ---------- pressure projection ----------
+        self.u, self.v, pressure = self.pressure_projection(u_star, v_star)
+
+        # 再施加一次挡板速度，并再次投影一次，减少“投影后强制固体速度”造成的散度误差。
+        self.u[mask] = us[mask]
+        self.v[mask] = vs[mask]
+        self.u, self.v, pressure = self.pressure_projection(self.u, self.v)
+        self.u[mask] = us[mask]
+        self.v[mask] = vs[mask]
+
+        # ---------- 温度 ----------
+        adv_T = self.advect_upwind(self.T, self.u, self.v)
+        self.T += p.dt * (
+            -adv_T
+            + p.kappa_T * self.laplacian(self.T)
+            - p.temperature_relaxation * (self.T - p.T0)
+        )
+        self.T[:, 0] = p.T_hot
+        self.T[:, -1] = p.T_cold
+
+        # ---------- 数值速度保护 ----------
+        speed = xp.hypot(self.u, self.v)
+        scale = xp.minimum(1.0, p.max_fluid_speed / xp.maximum(speed, 1e-30))
+        self.u *= scale
+        self.v *= scale
+
+        return pressure
+
+    # ---------- 网格插值 ----------
+    def interpolate(self, field, x, y):
+        # CNT 数组仍在 CPU；只在局部插值后把少量结果返回 CPU。
+        if self.use_gpu:
+            xg = cp.asarray(x)
+            yg = cp.asarray(y)
+        else:
+            xg = np.asarray(x)
+            yg = np.asarray(y)
+
+        fx = self.xp.clip(xg / self.dx - 0.5, 0.0, self.p.nx - 1.000001)
+        fy = (yg / self.dy - 0.5) % self.p.ny
+
+        i0 = self.xp.floor(fx).astype(int)
+        j0 = self.xp.floor(fy).astype(int)
+        i1 = self.xp.minimum(i0 + 1, self.p.nx - 1)
+        j1 = (j0 + 1) % self.p.ny
+        ax = fx - i0
+        ay = fy - j0
+
+        out = (
+            (1.0 - ax) * (1.0 - ay) * field[j0, i0]
+            + ax * (1.0 - ay) * field[j0, i1]
+            + (1.0 - ax) * ay * field[j1, i0]
+            + ax * ay * field[j1, i1]
+        )
+        return self.to_cpu(out)
+
+    def local_flow_tensors(self, x, y):
+        du_dx = self.interpolate(self.ddx(self.u), x, y)
+        du_dy = self.interpolate(self.ddy(self.u), x, y)
+        dv_dx = self.interpolate(self.ddx(self.v), x, y)
+        dv_dy = self.interpolate(self.ddy(self.v), x, y)
+        u = self.interpolate(self.u, x, y)
+        v = self.interpolate(self.v, x, y)
+
+        E11 = du_dx
+        E22 = dv_dy
+        E12 = 0.5 * (du_dy + dv_dx)
+        O12 = 0.5 * (du_dy - dv_dx)
+        omega = dv_dx - du_dy
+        return u, v, E11, E12, E22, O12, omega
+
+
+# ============================================================
+# 5. CNT 模型
+# ============================================================
+
+class CNTSystem:
+    def __init__(self, p: Params, rng):
+        self.p = p
+        self.rng = rng
+        self.use_gpu = False
+        if p.use_gpu and cp is not None and _CUPY_DCT_AVAILABLE:
+            try:
+                self.use_gpu = cp.cuda.runtime.getDeviceCount() > 0
+            except Exception:
+                self.use_gpu = False
+        self.current_barriers = (
+            0.5 * (p.Lx - p.initial_gap),
+            0.5 * (p.Lx + p.initial_gap),
+        )
+        self.state = self._initialize()
+        # 本版本不计算 CNT-CNT 力/吸引/取向相互作用。
+        # 仅保留几何接触检测、接触修正和严格防交叉检查。
+        self._cached_tau = np.zeros(p.n_rods)
+        self._cached_forces = np.zeros((p.n_rods, 2))
+        self._interaction_counter = 0
+
+    def _initialize(self):
+        p = self.p
+        n = p.n_rods
+        lengths = self.rng.uniform(p.rod_length_min, p.rod_length_max, n)
+        theta = self.rng.uniform(-0.5 * np.pi, 0.5 * np.pi, n)
+        x = self.rng.uniform(0.20 * p.Lx, 0.80 * p.Lx, n)
+        y = self.rng.uniform(0.02 * p.Ly, 0.98 * p.Ly, n)
+        state = CNTState(x, y, theta, lengths)
+
+        # 初始化时只接受不相交、不严重重叠的线段。
+        for i in range(n):
+            placed = False
+            for _ in range(300):
+                if not self._violates_any(i, state, p.initial_clearance):
+                    placed = True
+                    break
+                state.x[i] = self.rng.uniform(0.20 * p.Lx, 0.80 * p.Lx)
+                state.y[i] = self.rng.uniform(0.02 * p.Ly, 0.98 * p.Ly)
+                state.theta[i] = self.rng.uniform(-0.5 * np.pi, 0.5 * np.pi)
+            if not placed:
+                # 高填充率下随机放置可能失败；不伪造成功，给出警告并继续。
+                print(f"WARNING: initial placement of CNT {i} reached retry limit.")
+        return state
+
+    def _endpoints(self, i, state=None):
+        if state is None:
+            state = self.state
+        center = np.array([state.x[i], state.y[i]], dtype=float)
+        return segment_endpoints(center, state.theta[i], state.length[i])
+
+    def set_barriers(self, left, right):
+        self.current_barriers = (left, right)
+
+    def _violates_any(self, i, state, clearance):
+        a, b = self._endpoints(i, state)
+        for j in range(state.n):
+            if j == i:
+                continue
+            c0, d0 = self._endpoints(j, state)
+            for shift in (-self.p.Ly, 0.0, self.p.Ly):
+                c = c0.copy(); d = d0.copy()
+                c[1] += shift; d[1] += shift
+                if proper_or_touching_segment_intersection(a, b, c, d):
+                    return True
+                if segment_distance(a, b, c, d) < clearance:
+                    return True
+        return False
+
+    def pair_geometry(self, i, j):
+        a, b = self._endpoints(i)
+        c0, d0 = self._endpoints(j)
+        best = None
+        for shift in (-self.p.Ly, 0.0, self.p.Ly):
+            c = c0.copy(); d = d0.copy()
+            c[1] += shift; d[1] += shift
+            dist = segment_distance(a, b, c, d)
+            if best is None or dist < best[0]:
+                cp1, cp2 = closest_points_segments(a, b, c, d)
+                best = (dist, cp1, cp2)
+        return best
+
+    def coverage_field(self, nx, ny, Lx, Ly):
+        """粗粒化 CNT 表面覆盖率 phi(x,y)。"""
+        phi = np.zeros((ny, nx), dtype=float)
+        dx = Lx / nx
+        dy = Ly / ny
+        sigma = max(2.0 * dx, 2.0 * self.p.rod_diameter)
+        radius = 3.0 * sigma
+
+        for i in range(self.state.n):
+            a, b = self._endpoints(i)
+            xmin = max(0, int((min(a[0], b[0]) - radius) / dx))
+            xmax = min(nx - 1, int((max(a[0], b[0]) + radius) / dx) + 1)
+            ymin = int((min(a[1], b[1]) - radius) / dy)
+            ymax = int((max(a[1], b[1]) + radius) / dy) + 1
+
+            area_proxy = self.state.length[i] * self.p.rod_diameter
+            for jj in range(ymin, ymax + 1):
+                y = ((jj + 0.5) * dy) % Ly
+                for ii in range(xmin, xmax + 1):
+                    if not (0 <= ii < nx):
+                        continue
+                    x = (ii + 0.5) * dx
+                    dmin = np.inf
+                    for sy in (-Ly, 0.0, Ly):
+                        aa = a.copy(); bb = b.copy()
+                        aa[1] += sy; bb[1] += sy
+                        dmin = min(
+                            dmin,
+                            point_segment_distance(np.array([x, y]), aa, bb),
+                        )
+                    if dmin <= radius:
+                        w = math.exp(-0.5 * (dmin / sigma) ** 2)
+                        phi[jj % ny, ii] += w * area_proxy / (Lx * Ly)
+
+        return np.clip(phi, 0.0, 1.0)
+
+    def _gpu_pair_geometry_matrix(self):
+        """GPU 向量化计算全部 CNT 对的有限线段最短距离和作用方向。
+
+        返回：
+            dist[n,n]  : 周期 y 边界下的最短线段距离
+            nx[n,n], ny[n,n] : 从 j 指向 i 的最近点方向
+
+        这里不是用 CNT 中心点距离代替线段距离，而是对四个
+        endpoint-to-segment 距离 + 线段相交条件进行向量化，因此保留
+        原 pair_geometry() 的线段几何意义；只把 Python 双重循环搬到 GPU。
+        """
+        if not self.use_gpu or cp is None:
+            raise RuntimeError("GPU pair geometry requested but CuPy is unavailable.")
+
+        p = self.p
+        xp = cp
+        n = self.state.n
+
+        x = xp.asarray(self.state.x)
+        y = xp.asarray(self.state.y)
+        th = xp.asarray(self.state.theta)
+        L = xp.asarray(self.state.length)
+
+        half = 0.5 * L
+        c = xp.stack((x, y), axis=1)
+        e = xp.stack((xp.cos(th), xp.sin(th)), axis=1) * half[:, None]
+        a = c - e
+        b = c + e
+
+        # i 轴对应第一根 CNT，j 轴对应第二根 CNT。
+        A = a[:, None, :]
+        B = b[:, None, :]
+        C0 = a[None, :, :]
+        D0 = b[None, :, :]
+
+        best_d2 = xp.full((n, n), xp.inf, dtype=xp.float64)
+        best_dx = xp.zeros((n, n), dtype=xp.float64)
+        best_dy = xp.zeros((n, n), dtype=xp.float64)
+
+        def point_to_segment(P, Q, R):
+            """P 到 QR 的最近点、距离平方。P/Q/R 均为 [n,n,2]。"""
+            QR = R - Q
+            den = xp.sum(QR * QR, axis=2)
+            t = xp.sum((P - Q) * QR, axis=2) / xp.maximum(den, 1e-30)
+            t = xp.clip(t, 0.0, 1.0)
+            proj = Q + t[..., None] * QR
+            d = P - proj
+            return proj, xp.sum(d * d, axis=2)
+
+        def cross2(U, V):
+            return U[..., 0] * V[..., 1] - U[..., 1] * V[..., 0]
+
+        # 三个周期镜像，选择真正的最短线段距离。
+        for shift in (-p.Ly, 0.0, p.Ly):
+            C = C0.copy()
+            D = D0.copy()
+            C[..., 1] += shift
+            D[..., 1] += shift
+
+            # 四个 endpoint -> opposite segment 的距离。
+            qA, d2_A = point_to_segment(A, C, D)
+            qB, d2_B = point_to_segment(B, C, D)
+            qC, d2_C = point_to_segment(C, A, B)
+            qD, d2_D = point_to_segment(D, A, B)
+
+            # 严格二维线段相交/接触：相交则距离为 0。
+            AB = B - A
+            CD = D - C
+            o1 = cross2(AB, C - A)
+            o2 = cross2(AB, D - A)
+            o3 = cross2(CD, A - C)
+            o4 = cross2(CD, B - C)
+
+            minx_ab = xp.minimum(A[..., 0], B[..., 0])
+            maxx_ab = xp.maximum(A[..., 0], B[..., 0])
+            miny_ab = xp.minimum(A[..., 1], B[..., 1])
+            maxy_ab = xp.maximum(A[..., 1], B[..., 1])
+            minx_cd = xp.minimum(C[..., 0], D[..., 0])
+            maxx_cd = xp.maximum(C[..., 0], D[..., 0])
+            miny_cd = xp.minimum(C[..., 1], D[..., 1])
+            maxy_cd = xp.maximum(C[..., 1], D[..., 1])
+            bbox = (
+                (maxx_ab >= minx_cd - 1e-14)
+                & (maxx_cd >= minx_ab - 1e-14)
+                & (maxy_ab >= miny_cd - 1e-14)
+                & (maxy_cd >= miny_ab - 1e-14)
+            )
+            intersects = (
+                (o1 * o2 <= 1e-28)
+                & (o3 * o4 <= 1e-28)
+                & bbox
+            )
+
+            d2_stack = xp.stack((d2_A, d2_B, d2_C, d2_D), axis=0)
+            idx = xp.argmin(d2_stack, axis=0)
+            d2 = xp.min(d2_stack, axis=0)
+            d2 = xp.where(intersects, 0.0, d2)
+
+            # 对应最近点对：
+            # A->CD, B->CD, C->AB, D->AB。
+            # A/B 的形状是 (n,1)，qC/qD/C/D 的形状是 (n,n)。
+            # 不能直接 xp.stack，否则会触发 CuPy 的 shape mismatch。
+            # 用逐级 where，让 (n,1) 自动广播到 (n,n)，保持原有几何逻辑不变。
+            cp_i_x = xp.where(
+                idx == 0, A[..., 0],
+                xp.where(idx == 1, B[..., 0],
+                         xp.where(idx == 2, qC[..., 0], qD[..., 0]))
+            )
+            cp_i_y = xp.where(
+                idx == 0, A[..., 1],
+                xp.where(idx == 1, B[..., 1],
+                         xp.where(idx == 2, qC[..., 1], qD[..., 1]))
+            )
+            cp_j_x = xp.where(
+                idx == 0, qA[..., 0],
+                xp.where(idx == 1, qB[..., 0],
+                         xp.where(idx == 2, C[..., 0], D[..., 0]))
+            )
+            cp_j_y = xp.where(
+                idx == 0, qA[..., 1],
+                xp.where(idx == 1, qB[..., 1],
+                         xp.where(idx == 2, C[..., 1], D[..., 1]))
+            )
+
+            ddx = cp_i_x - cp_j_x
+            ddy = cp_i_y - cp_j_y
+
+            take = d2 < best_d2
+            best_d2 = xp.where(take, d2, best_d2)
+            best_dx = xp.where(take, ddx, best_dx)
+            best_dy = xp.where(take, ddy, best_dy)
+
+        dist = xp.sqrt(xp.maximum(best_d2, 0.0))
+
+        # 对真正相交/完全重合的对，最近点方向退化；使用 CNT 中心的
+        # 最小周期位移作为排斥方向，避免 NaN。
+        center_dx = x[:, None] - x[None, :]
+        center_dy = y[:, None] - y[None, :]
+        center_dy = center_dy - p.Ly * xp.round(center_dy / p.Ly)
+        norm = xp.hypot(best_dx, best_dy)
+        fallback_norm = xp.hypot(center_dx, center_dy)
+        use_fallback = norm < 1e-15
+        nx = xp.where(use_fallback, center_dx / xp.maximum(fallback_norm, 1e-15), best_dx / xp.maximum(norm, 1e-15))
+        ny = xp.where(use_fallback, center_dy / xp.maximum(fallback_norm, 1e-15), best_dy / xp.maximum(norm, 1e-15))
+
+        return dist, nx, ny
+
+    def _gpu_candidate_pairs(self, clearance):
+        """GPU 宽相位：筛出可能接触的 CNT 对，精确几何仍由 CPU 窄相位确认。"""
+        if not self.use_gpu or cp is None:
+            return None
+
+        x = cp.asarray(self.state.x)
+        y = cp.asarray(self.state.y)
+        L = cp.asarray(self.state.length)
+        dx = x[:, None] - x[None, :]
+        dy = y[:, None] - y[None, :]
+        dy = dy - self.p.Ly * cp.round(dy / self.p.Ly)
+        center_d = cp.hypot(dx, dy)
+        reach = 0.5 * L[:, None] + 0.5 * L[None, :] + clearance
+        mask = center_d <= reach
+        iu, ju = cp.triu_indices(self.state.n, k=1)
+        keep = mask[iu, ju]
+        return list(zip(cp.asnumpy(iu[keep]).tolist(), cp.asnumpy(ju[keep]).tolist()))
+
+    def interaction_torques(self):
+        """返回每根 CNT 的相互作用力矩和中心力。
+
+        GPU 模式下：180 根 CNT 的 pairwise 线段几何、取向力矩和径向力
+        全部向量化计算；CPU 只负责把最终 n 根 CNT 的结果取回。
+        """
+        p = self.p
+        n = self.state.n
+
+        if self.use_gpu and cp is not None:
+            xp = cp
+            dist, nx, ny = self._gpu_pair_geometry_matrix()
+
+            ii, jj = xp.triu_indices(n, k=1)
+            d = dist[ii, jj]
+            nx_ij = nx[ii, jj]
+            ny_ij = ny[ii, jj]
+
+            active = d <= p.interaction_cutoff
+            d_safe = xp.maximum(d, 1e-12)
+            dtheta = xp.asarray(self.state.theta)[ii] - xp.asarray(self.state.theta)[jj]
+
+            w = xp.exp(-d_safe / p.orient_length)
+            tau_align = p.alignment_strength * w * xp.sin(2.0 * dtheta)
+            tau_align = xp.where(active, tau_align, 0.0)
+
+            tau = xp.zeros(n, dtype=xp.float64)
+            xp.add.at(tau, ii, -tau_align)
+            xp.add.at(tau, jj, tau_align)
+
+            dU_dd = (
+                -p.repulsion_strength / p.repulsion_length
+                * xp.exp(-d_safe / p.repulsion_length)
+                + p.attraction_strength / p.attraction_length
+                * xp.exp(-d_safe / p.attraction_length)
+            )
+            Fx = -dU_dd * nx_ij
+            Fy = -dU_dd * ny_ij
+            Fnorm = xp.hypot(Fx, Fy)
+            fscale = xp.minimum(1.0, p.max_force_per_rod / xp.maximum(Fnorm, 1e-30))
+            Fx *= fscale
+            Fy *= fscale
+            Fx = xp.where(active, Fx, 0.0)
+            Fy = xp.where(active, Fy, 0.0)
+
+            forces = xp.zeros((n, 2), dtype=xp.float64)
+            xp.add.at(forces[:, 0], ii, Fx)
+            xp.add.at(forces[:, 1], ii, Fy)
+            xp.add.at(forces[:, 0], jj, -Fx)
+            xp.add.at(forces[:, 1], jj, -Fy)
+
+            return cp.asnumpy(tau), cp.asnumpy(forces)
+
+        # CPU 回退：保留原来的精确 pairwise 实现。
+        tau = np.zeros(n)
+        forces = np.zeros((n, 2))
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist, cp_i, cp_j = self.pair_geometry(i, j)
+                if dist > p.interaction_cutoff:
+                    continue
+                dtheta = self.state.theta[i] - self.state.theta[j]
+                w = math.exp(-dist / p.orient_length)
+                tau_align = p.alignment_strength * w * math.sin(2.0 * dtheta)
+                tau[i] -= tau_align
+                tau[j] += tau_align
+                if dist > 1e-12:
+                    nvec = (cp_i - cp_j) / dist
+                else:
+                    cvec = np.array([
+                        self.state.x[i] - self.state.x[j],
+                        minimum_image_periodic_y(self.state.y[i] - self.state.y[j], p.Ly),
+                    ])
+                    cn = np.linalg.norm(cvec)
+                    nvec = cvec / max(cn, 1e-12)
+                dU_dd = (
+                    -p.repulsion_strength / p.repulsion_length
+                    * math.exp(-dist / p.repulsion_length)
+                    + p.attraction_strength / p.attraction_length
+                    * math.exp(-dist / p.attraction_length)
+                )
+                F = clamp_norm(-dU_dd * nvec, p.max_force_per_rod)
+                forces[i] += F
+                forces[j] -= F
+        return tau, forces
+
+    def local_nematic_order(self):
+        """每根 CNT 周围邻域的 apolar 二阶序参数。"""
+        p = self.p
+        n = self.state.n
+        out = np.zeros(n)
+        cutoff = 0.12 * p.Lx
+
+        for i in range(n):
+            z = 0j
+            count = 0
+            for j in range(n):
+                if i == j:
+                    continue
+                dx = self.state.x[j] - self.state.x[i]
+                dy = minimum_image_periodic_y(
+                    self.state.y[j] - self.state.y[i], p.Ly
+                )
+                if math.hypot(dx, dy) < cutoff:
+                    z += np.exp(2j * self.state.theta[j])
+                    count += 1
+            out[i] = abs(z) / count if count else 0.0
+        return out
+
+    def global_nematic_order(self):
+        return float(abs(np.mean(np.exp(2j * self.state.theta))))
+
+    def _flow_and_jeffery(self, fluid):
+        p = self.p
+        x, y, th = self.state.x, self.state.y, self.state.theta
+        u, v, E11, E12, E22, O12, omega = fluid.local_flow_tensors(x, y)
+
+        pvec = np.column_stack((np.cos(th), np.sin(th)))
+        aspect = np.maximum(self.state.length / p.rod_diameter, 2.0)
+        lam = (aspect**2 - 1.0) / (aspect**2 + 1.0)
+
+        theta_dot = np.zeros(self.state.n)
+        for i in range(self.state.n):
+            pp = pvec[i]
+            E = np.array([[E11[i], E12[i]], [E12[i], E22[i]]])
+            Om = np.array([[0.0, O12[i]], [-O12[i], 0.0]])
+            dp = Om @ pp + lam[i] * (
+                E @ pp - pp * float(pp @ E @ pp)
+            )
+            perp = np.array([-pp[1], pp[0]])
+            theta_dot[i] = float(np.dot(dp, perp))
+
+        return u, v, theta_dot, omega, pvec, aspect
+
+    def update(self, fluid: FluidSolver, dt):
+        """CNT 平移+旋转；本版本不计算 CNT-CNT 两两相互作用，只保留几何接触。"""
+        p = self.p
+        n = self.state.n
+        self.set_barriers(fluid.barrier_x_left, fluid.barrier_x_right)
+
+        u, v, theta_dot, omega, pvec, aspect = self._flow_and_jeffery(fluid)
+
+        # ---------- CNT-CNT 两两相互作用关闭 ----------
+        # 不计算吸引、排斥和取向力矩；仅保留后面的几何接触检测。
+        # 因而 CNT 的运动只来自：流体速度场、Jeffery 旋转、Brownian、
+        # 挡板接触以及 CNT-CNT 几何防交叉约束。
+        tau_int = np.zeros(n)
+        forces_int = np.zeros((n, 2))
+
+        # ---------- Brownian rotational diffusion ----------
+        kT = KB * p.temperature_cnt
+        D_r = 3.0 * kT / (
+            np.pi * p.mu * self.state.length**3
+        )
+        zeta_r = (
+            np.pi * p.mu * self.state.length**3
+            / (3.0 * np.maximum(np.log(aspect), p.drag_log_floor))
+        )
+        theta_dot += (
+            tau_int / np.maximum(zeta_r, 1e-30)
+            * p.rotational_drag_scale
+        )
+        theta_dot += (
+            p.brownian_rotation_scale
+            * np.sqrt(2.0 * D_r / dt)
+            * self.rng.normal(size=n)
+        )
+        theta_dot = np.clip(
+            theta_dot, -p.max_angular_speed, p.max_angular_speed
+        )
+        theta_new = wrap_angle(self.state.theta + dt * theta_dot)
+
+        # ---------- 各向异性平移迁移率 ----------
+        log_term = np.maximum(np.log(aspect), p.drag_log_floor)
+        zeta_parallel = 2.0 * np.pi * p.mu * self.state.length / log_term
+        zeta_perp = 4.0 * np.pi * p.mu * self.state.length / log_term
+
+        fluid_vel = np.column_stack((u, v))
+        rod_vel = fluid_vel.copy()
+
+        # 正确的各向异性过阻尼运动：
+        # V = U + M_parallel F_parallel + M_perp F_perp + Brownian。
+        for i in range(n):
+            pp = pvec[i]
+            nn = np.array([-pp[1], pp[0]])
+            F = forces_int[i]
+            Fpar = np.dot(F, pp) * pp
+            Fperp = np.dot(F, nn) * nn
+            rod_vel[i] += p.drag_coupling_scale * (
+                Fpar / zeta_parallel[i]
+                + Fperp / zeta_perp[i]
+            )
+
+        # ---------- Brownian translation ----------
+        Dpar = kT / zeta_parallel
+        Dperp = kT / zeta_perp
+        for i in range(n):
+            pp = pvec[i]
+            nn = np.array([-pp[1], pp[0]])
+            dWpar = self.rng.normal()
+            dWperp = self.rng.normal()
+            rod_vel[i] += p.brownian_translation_scale * (
+                math.sqrt(2.0 * Dpar[i] / dt) * dWpar * pp
+                + math.sqrt(2.0 * Dperp[i] / dt) * dWperp * nn
+            )
+
+        # 速度限制仅为数值安全，不是取向增强机制。
+        speed = np.linalg.norm(rod_vel, axis=1)
+        scale = np.minimum(1.0, p.max_cnt_speed / np.maximum(speed, 1e-30))
+        rod_vel *= scale[:, None]
+
+        # 保存旧状态，以便接触解析失败时可以回退。
+        old_x = self.state.x.copy()
+        old_y = self.state.y.copy()
+        old_theta = self.state.theta.copy()
+
+        self.state.x += dt * rod_vel[:, 0]
+        self.state.y = wrap_y(self.state.y + dt * rod_vel[:, 1], p.Ly)
+        self.state.theta = theta_new
+
+        self.resolve_barrier_contacts()
+        self.resolve_pair_contacts()
+
+        # 严格检查；若仍存在交叉，则回退本时间步的 CNT 运动。
+        if self.count_intersections() > 0:
+            self.state.x[:] = old_x
+            self.state.y[:] = old_y
+            self.state.theta[:] = old_theta
+
+        # 过阻尼准静态近似下：hydrodynamic force on fluid = non-hydrodynamic
+        # force on CNT. 这避免把“CNT跟随流体”重复计算成虚假的流体源项。
+        reaction_on_fluid = forces_int * p.drag_coupling_scale
+        return reaction_on_fluid, omega
+
+    def resolve_barrier_contacts(self):
+        p = self.p
+        xl, xr = self.current_barriers
+        for i in range(self.state.n):
+            a, b = self._endpoints(i)
+            min_x = min(a[0], b[0])
+            max_x = max(a[0], b[0])
+            if min_x < xl + p.contact_clearance:
+                self.state.x[i] += xl + p.contact_clearance - min_x
+            if max_x > xr - p.contact_clearance:
+                self.state.x[i] -= max_x - (xr - p.contact_clearance)
+
+    def resolve_pair_contacts(self, iterations=4):
+        """几何接触修正；GPU 宽相位筛选 + CPU 精确窄相位。"""
+        p = self.p
+        n = self.state.n
+
+        for _ in range(iterations):
+            changed = False
+            candidate_pairs = self._gpu_candidate_pairs(p.contact_clearance) if self.use_gpu else None
+            if candidate_pairs is None:
+                candidate_pairs = ((i, j) for i in range(n) for j in range(i + 1, n))
+
+            for i, j in candidate_pairs:
+                    a, b = self._endpoints(i)
+                    c0, d0 = self._endpoints(j)
+                    best = None
+                    best_shift = 0.0
+                    for shift in (-p.Ly, 0.0, p.Ly):
+                        c = c0.copy(); d = d0.copy()
+                        c[1] += shift; d[1] += shift
+                        dist = segment_distance(a, b, c, d)
+                        if best is None or dist < best[0]:
+                            best = (dist, c, d)
+                            best_shift = shift
+
+                    dist, c, d = best
+                    if dist < p.contact_clearance:
+                        cp1, cp2 = closest_points_segments(a, b, c, d)
+                        rv = cp1 - cp2
+                        rn = float(np.linalg.norm(rv))
+                        if rn < 1e-15:
+                            rv = np.array([
+                                self.state.x[i] - self.state.x[j],
+                                minimum_image_periodic_y(
+                                    self.state.y[i] - self.state.y[j], p.Ly
+                                ),
+                            ])
+                            rn = float(np.linalg.norm(rv))
+                        if rn < 1e-15:
+                            rv = np.array([1.0, 0.0])
+                            rn = 1.0
+                        nvec = rv / rn
+                        correction = 0.5 * (p.contact_clearance - dist + 1e-12) * nvec
+                        self.state.x[i] += correction[0]
+                        self.state.y[i] = wrap_y(
+                            self.state.y[i] + correction[1], p.Ly
+                        )
+                        self.state.x[j] -= correction[0]
+                        self.state.y[j] = wrap_y(
+                            self.state.y[j] - correction[1], p.Ly
+                        )
+                        changed = True
+
+            self.resolve_barrier_contacts()
+            if not changed:
+                break
+
+    def count_intersections(self):
+        p = self.p
+        count = 0
+        candidate_pairs = self._gpu_candidate_pairs(0.0) if self.use_gpu else None
+        if candidate_pairs is None:
+            candidate_pairs = ((i, j) for i in range(self.state.n) for j in range(i + 1, self.state.n))
+
+        for i, j in candidate_pairs:
+            a, b = self._endpoints(i)
+            c0, d0 = self._endpoints(j)
+            for shift in (-p.Ly, 0.0, p.Ly):
+                c = c0.copy(); d = d0.copy()
+                c[1] += shift; d[1] += shift
+                if proper_or_touching_segment_intersection(a, b, c, d):
+                    count += 1
+        return count
+
+    def force_density_on_fluid(self, reaction_force, nx, ny, Lx, Ly):
+        """将 CNT->fluid 反作用力 [N/rod] 粗粒化成 Eulerian 体力 [N/m^3]。"""
+        p = self.p
+        fx = np.zeros((ny, nx), dtype=float)
+        fy = np.zeros_like(fx)
+        dx = Lx / nx
+        dy = Ly / ny
+
+        # 2D Gaussian 核积分为1；再除 interface_depth 得到体力密度。
+        eps = 1.5 * max(dx, dy)
+        inv = 1.0 / (2.0 * np.pi * eps**2)
+        radius = 3.0 * eps
+
+        for i in range(self.state.n):
+            a, b = self._endpoints(i)
+            nseg = max(4, int(self.state.length[i] / (0.5 * eps)))
+            fpt = reaction_force[i] / nseg
+
+            for s in np.linspace(0.0, 1.0, nseg):
+                q = a * (1.0 - s) + b * s
+                ix0 = max(0, int((q[0] - radius) / dx))
+                ix1 = min(nx - 1, int((q[0] + radius) / dx))
+                jy0 = int((q[1] - radius) / dy)
+                jy1 = int((q[1] + radius) / dy)
+
+                for jj in range(jy0, jy1 + 1):
+                    yy = ((jj + 0.5) * dy) % Ly
+                    dyq = minimum_image_periodic_y(yy - q[1], Ly)
+                    for ii in range(ix0, ix1 + 1):
+                        xx = (ii + 0.5) * dx
+                        rr2 = (xx - q[0])**2 + dyq**2
+                        if rr2 <= radius**2:
+                            w = inv * math.exp(-0.5 * rr2 / eps**2)
+                            fx[jj % ny, ii] += fpt[0] * w / p.interface_depth
+                            fy[jj % ny, ii] += fpt[1] * w / p.interface_depth
+        return fx, fy
+
+    def diagnostics(self):
+        local = self.local_nematic_order()
+        global_s = self.global_nematic_order()
+        min_dist = np.inf
+        n = self.state.n
+
+        for i in range(n):
+            a, b = self._endpoints(i)
+            for j in range(i + 1, n):
+                c0, d0 = self._endpoints(j)
+                for shift in (-self.p.Ly, 0.0, self.p.Ly):
+                    c = c0.copy(); d = d0.copy()
+                    c[1] += shift; d[1] += shift
+                    min_dist = min(min_dist, segment_distance(a, b, c, d))
+
+        z = np.mean(np.exp(2j * self.state.theta))
+        mean_theta = 0.5 * np.angle(z)
+
+        return {
+            "S_global": float(global_s),
+            "S_local_mean": float(np.mean(local)),
+            "S_local_p90": float(np.quantile(local, 0.90)),
+            "min_segment_distance_m": float(min_dist if np.isfinite(min_dist) else 0.0),
+            "intersection_count": int(self.count_intersections()),
+            "mean_theta_deg": float(np.rad2deg(mean_theta)),
+        }
+
+
+# ============================================================
+# 6. 输出
+# ============================================================
+
+def render_cnts(cnt: CNTSystem, p: Params):
+    """
+    超采样渲染 + 最终压缩区裁剪。
+
+    逻辑：
+    1. 先以 render_px×render_px（默认 1024×1024）渲染整个计算域；
+    2. 根据最终左右挡板位置，只截取两挡板之间的 CNT 膜区域，
+       从而彻底去掉挡板运动扫过后的左右黑色空白；
+    3. 将这个“最终压缩区”缩放到 output_px×output_px（512×512）保存。
+
+    注意：最终图像代表压缩后的膜区域，而不是整个原始 1 mm×1 mm 计算域。
+    不渲染挡板本身。
+    """
+    big_px = int(max(p.render_px, p.output_px))
+    full = np.zeros((big_px, big_px), dtype=np.uint8)
+    sx = big_px / p.Lx
+    sy = big_px / p.Ly
+
+    for i in range(cnt.state.n):
+        a, b = cnt._endpoints(i)
+        for shift in (-p.Ly, 0.0, p.Ly):
+            aa = a.copy(); bb = b.copy()
+            aa[1] += shift; bb[1] += shift
+            x1 = int(round(aa[0] * sx))
+            y1 = int(round((p.Ly - aa[1]) * sy))
+            x2 = int(round(bb[0] * sx))
+            y2 = int(round((p.Ly - bb[1]) * sy))
+
+            if cv2 is not None:
+                cv2.line(
+                    full,
+                    (x1, y1), (x2, y2),
+                    255, 2,
+                    lineType=cv2.LINE_8,
+                )
+            else:
+                npts = max(2, int(np.hypot(x2 - x1, y2 - y1)) + 1)
+                xs = np.rint(np.linspace(x1, x2, npts)).astype(int)
+                ys = np.rint(np.linspace(y1, y2, npts)).astype(int)
+                valid = (
+                    (xs >= 0) & (xs < big_px)
+                    & (ys >= 0) & (ys < big_px)
+                )
+                full[ys[valid], xs[valid]] = 255
+
+    # 只保留最终两挡板之间的区域。
+    # 使用最终 barrier center，再向内留半个 clearance，避免把挡板位置附近的
+    # 数值接触区域误认为黑边。
+    left_x = float(cnt.current_barriers[0]) + 0.5 * p.barrier_width
+    right_x = float(cnt.current_barriers[1]) - 0.5 * p.barrier_width
+    left_px = int(np.ceil(np.clip(left_x * sx, 0, big_px - 1)))
+    right_px = int(np.floor(np.clip(right_x * sx, left_px + 1, big_px)))
+
+    cropped = full[:, left_px:right_px]
+    if cropped.size == 0 or cropped.shape[1] < 2:
+        raise RuntimeError(
+            f"最终压缩区裁剪失败：left_px={left_px}, right_px={right_px}, "
+            f"full_width={big_px}"
+        )
+
+    # 最终强制输出 512×512。INTER_AREA 用于缩小，避免产生明显锯齿。
+    if cv2 is not None:
+        img = cv2.resize(
+            cropped,
+            (p.output_px, p.output_px),
+            interpolation=cv2.INTER_AREA,
+        )
+        # 保持最终图像严格二值：CNT=255，背景=0。
+        img = np.where(img >= 128, 255, 0).astype(np.uint8)
+    else:
+        from PIL import Image
+        img = np.asarray(
+            Image.fromarray(cropped).resize(
+                (p.output_px, p.output_px), Image.Resampling.LANCZOS
+            )
+        )
+        img = np.where(img >= 128, 255, 0).astype(np.uint8)
+
+    return img
+
+
+def save_state(cnt, path):
+    arr = np.column_stack((
+        cnt.state.x,
+        cnt.state.y,
+        cnt.state.theta,
+        cnt.state.length,
+    ))
+    np.savetxt(
+        path,
+        arr,
+        delimiter=",",
+        header="x_m,y_m,theta_rad,length_m",
+        comments="",
+    )
+
+
+def save_json(data, path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# ============================================================
+# 7. 主程序
+# ============================================================
+
+def run(output_dir="CNT_LB_fluid_coupled_final_output", image_filename="CNT_LB_final_512px.png"):
+    import time as _time
+    _run_wall_start = _time.perf_counter()
+    p = P
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    rng = np.random.default_rng(p.seed)
+
+    # 每次运行随机选择 100~150 根 CNT，范围包含端点。
+    p.n_rods = int(rng.integers(p.n_rods_min, p.n_rods_max + 1))
+    print(f"本次随机 CNT 数量: {p.n_rods}")
+
+    fluid = FluidSolver(p)
+    cnt = CNTSystem(p, rng)
+
+    diagnostics = []
+    omega_last = np.zeros_like(fluid.u)
+
+    # CNT -> 水反馈已完全关闭，因此覆盖率场不再需要计算。
+    coverage = np.zeros_like(fluid.u)
+    cnt_force = (
+        np.zeros_like(fluid.u),
+        np.zeros_like(fluid.v),
+    )
+
+    # 显式稳定性检查：扩散和对流的保守上限。
+    dt_diff = 0.25 * min(fluid.dx, fluid.dy)**2 / p.nu
+    dt_adv = 0.5 * min(fluid.dx, fluid.dy) / max(p.max_fluid_speed, 1e-30)
+    dt_limit = min(dt_diff, dt_adv)
+    if p.dt > dt_limit:
+        print(
+            f"WARNING: dt={p.dt:.3e}s > conservative limit "
+            f"{dt_limit:.3e}s; reduce Params.dt if instability occurs."
+        )
+
+    # 初始化挡板位置。
+    fluid.update_barriers(0.0)
+    cnt.set_barriers(fluid.barrier_x_left, fluid.barrier_x_right)
+
+    for step in range(p.n_steps):
+        sim_time = step * p.dt
+
+        # 1. 流体：完全不接收 CNT -> fluid 反馈。
+        fluid.step(cnt_force, coverage, sim_time)
+
+        # 2. CNT：Jeffery + Brownian + 几何接触检测。
+        #    CNT-CNT 吸引/排斥/取向相互作用已关闭。
+        reaction_on_fluid, omega_last = cnt.update(fluid, p.dt)
+
+        # 3. CNT -> 水反馈全部关闭。
+        #    reaction_on_fluid 不再传回流体；CNT 覆盖率也不改变水的表面张力。
+        #    因此不再计算无效的 CNT 反馈场，以节省运行时间。
+        cnt_force = (
+            np.zeros_like(fluid.u),
+            np.zeros_like(fluid.v),
+        )
+
+        # 4. 诊断。
+        if step % p.save_every == 0 or step == p.n_steps - 1:
+            d = cnt.diagnostics()
+            d.update({
+                "step": int(step),
+                "time_s": float(sim_time),
+                "n_rods": int(cnt.state.n),
+                "gap_m": float(
+                    fluid.barrier_x_right - fluid.barrier_x_left
+                ),
+                "max_fluid_speed_m_s": float(
+                    np.max(np.hypot(
+                        fluid.to_cpu(fluid.u),
+                        fluid.to_cpu(fluid.v),
+                    ))
+                ),
+                "mean_abs_vorticity_s-1": float(
+                    np.mean(np.abs(omega_last))
+                ),
+                "max_abs_vorticity_s-1": float(
+                    np.max(np.abs(omega_last))
+                ),
+                "mean_temperature_K": float(np.mean(fluid.T)),
+                "max_temperature_K": float(np.max(fluid.T)),
+                "min_temperature_K": float(np.min(fluid.T)),
+            })
+            diagnostics.append(d)
+            _elapsed = _time.perf_counter() - _run_wall_start
+            _steps_done = step + 1
+            _avg_step = _elapsed / max(_steps_done, 1)
+            _remaining = _avg_step * max(p.n_steps - _steps_done, 0)
+            _elapsed_hms = str(__import__("datetime").timedelta(seconds=int(_elapsed)))
+            _remaining_hms = str(__import__("datetime").timedelta(seconds=int(_remaining)))
+            print(
+                f"step={step:5d}/{p.n_steps} "
+                f"gap={d['gap_m']*1e6:7.1f} um "
+                f"Sg={d['S_global']:.3f} "
+                f"Sl={d['S_local_mean']:.3f} "
+                f"|w|max={d['max_abs_vorticity_s-1']:.2f} "
+                f"cross={d['intersection_count']} "
+                f"已用={_elapsed_hms} 预计剩余={_remaining_hms}"
+            )
+
+    # ---------- 最终输出 ----------
+    img = render_cnts(cnt, p)
+    image_path = out / image_filename
+    if cv2 is not None:
+        cv2.imwrite(str(image_path), img)
+    else:
+        from PIL import Image
+        Image.fromarray(img).save(image_path)
+
+    _total_elapsed = _time.perf_counter() - _run_wall_start
+    _total_hms = str(__import__("datetime").timedelta(seconds=int(_total_elapsed)))
+    print("\n" + "=" * 70)
+    print(f"模拟完成：实际运行时间 {_total_hms}")
+    print(f"最终图片：{image_path}")
+    print("=" * 70)
+
+    return out
+
+
+if __name__ == "__main__":
+    # ========================================================
+    # 批量生成设置（仅此处为批量运行修改）
+    # ========================================================
+    OUTPUT_ROOT = r"D:/cey/CNTs_detials/ML_U_net/test/hr"
+    BATCH_COUNT = 1
+    BASE_SEED = 1000000
+
+    # 所有图片直接保存在 OUTPUT_ROOT，不再为每个随机种子创建子文件夹。
+    # 单次运行使用默认文件名；批量运行时在文件名中加入编号和种子，避免覆盖。
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    for batch_id in range(1, BATCH_COUNT + 1):
+        P.seed = BASE_SEED + batch_id - 1
+        if BATCH_COUNT == 1:
+            image_filename = "CNT_LB_final_512px.png"
+        else:
+            image_filename = f"CNT_LB_{batch_id:04d}_seed{P.seed}_512px_hr.png"
+        print("\n" + "=" * 70)
+        print(f"开始第 {batch_id}/{BATCH_COUNT} 组模拟")
+        print(f"随机种子: {P.seed}")
+        print(f"图片直接保存至: {os.path.join(OUTPUT_ROOT, image_filename)}")
+        print("=" * 70)
+        run(OUTPUT_ROOT, image_filename=image_filename)
+
+    print("\n全部批量模拟完成。")
+
